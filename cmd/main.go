@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"math/rand"
 	"os"
@@ -9,14 +10,17 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/google/go-github/github"
 	"github.com/hashicorp/go-version"
 	"github.com/renproject/darknode-cli/cmd/provider"
+	"github.com/renproject/darknode-cli/darknode"
+	"github.com/renproject/darknode-cli/darknode/addr"
 	"github.com/renproject/darknode-cli/util"
 	"github.com/urfave/cli"
 )
 
-// BinaryVersion will be populated when building the binary.
-var BinaryVersion = "undefined"
+// This will be populated on build
+var binaryVersion = "undefined"
 
 func init() {
 	rand.Seed(time.Now().UTC().UnixNano())
@@ -27,7 +31,7 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "Darknode CLI"
 	app.Usage = "A command-line tool for managing Darknodes."
-	app.Version = BinaryVersion
+	app.Version = binaryVersion
 
 	// Fetch latest release and check if our version is behind.
 	checkUpdates(app.Version)
@@ -45,7 +49,7 @@ func main() {
 				// Digital Ocean
 				DoFlag, DoRegionFlag, DoSizeFlag, DoTokenFlag,
 				// Google Cloud Platform
-				GcpFlag, GcpRegionFlag, GcpCredFlag, GcpMachineFlag,
+				GcpFlag, GcpZoneFlag, GcpCredFlag, GcpMachineFlag,
 			},
 			Action: func(c *cli.Context) error {
 				p, err := provider.ParseProvider(c)
@@ -53,6 +57,25 @@ func main() {
 					return err
 				}
 				return p.Deploy(c)
+			},
+		},
+		{
+			Name:  "multi-up",
+			Usage: "Deploy multiple",
+			Flags: []cli.Flag{
+				// General
+				NameFlag, TagsFlag, NetworkFlag, NumberFlag,
+				// AWS
+				AwsFlag, AwsAccessKeyFlag, AwsSecretKeyFlag,
+				// Digital Ocean
+				DoFlag, DoRegionFlag, DoSizeFlag, DoTokenFlag,
+			},
+			Action: func(c *cli.Context) error {
+				p, err := provider.ParseProvider(c)
+				if err != nil {
+					return err
+				}
+				return p.DeployMultiple(c)
 			},
 		},
 		{
@@ -78,7 +101,7 @@ func main() {
 			Usage: "SSH into one of your Darknode",
 			Action: func(c *cli.Context) error {
 				name := c.Args().First()
-				if err := util.ValidateNodeExistence(name); err != nil {
+				if err := util.ValidateNodeName(name); err != nil {
 					return err
 				}
 				ip, err := util.IP(name)
@@ -148,25 +171,64 @@ func main() {
 		{
 			Name:  "register",
 			Usage: "Redirect you to the register page of a particular darknode",
-			Flags: []cli.Flag{},
+			Flags: []cli.Flag{TagsFlag},
 			Action: func(c *cli.Context) error {
 				name := c.Args().First()
-				if err := util.ValidateNodeExistence(name); err != nil {
-					return err
-				}
+				tags := c.String("tags")
 
-				url, err := util.RegisterUrl(name)
-				if err != nil {
-					return err
+				type Call struct {
+					DarknodeName   string `json:"darknode_name"`
+					DarknodeID     string `json:"_darknodeID"`
 				}
-				color.Green("If the browser doesn't open for you, please copy the following url and open in browser.")
-				color.Green(url)
-				return util.OpenInBrowser(url)
+				if tags != "" {
+					nodes, err := util.GetNodesByTags(tags)
+					if err != nil {
+						return err
+					}
+					calls := make([]Call, len(nodes))
+
+					for i, node := range nodes {
+						path := filepath.Join(util.NodePath(node), "config.json")
+						config, err := darknode.NewConfigFromJSONFile(path)
+						if err != nil {
+							return err
+						}
+						id := addr.FromPublicKey(config.Keystore.Ecdsa.PublicKey)
+						ethAddr, err := id.ToEthereumAddress()
+						if err != nil {
+							return err
+						}
+						calls[i] = Call{
+							DarknodeName: node,
+							DarknodeID:   ethAddr.Hex(),
+						}
+					}
+
+					data, err := json.MarshalIndent(calls, "", "	")
+					if err != nil {
+						return err
+					}
+					color.Green("%v", string(data))
+
+					return nil
+				} else {
+					if err := util.ValidateNodeName(name); err != nil {
+						return err
+					}
+
+					url, err := util.RegisterUrl(name)
+					if err != nil {
+						return err
+					}
+					color.Green("If the browser doesn't open for you, please copy the following url and open in browser.")
+					color.Green(url)
+					return util.OpenInBrowser(url)
+				}
 			},
 		},
 	}
 
-	// Show error message and display the help page when command not found.
+	// Show error message and display the help page for the app
 	app.CommandNotFound = func(c *cli.Context, command string) {
 		if err := cli.ShowAppHelp(c); err != nil {
 			panic(err)
@@ -186,11 +248,10 @@ func main() {
 // checkUpdates fetches the latest release of `darknode-cli` from github and compare the versions. It warns the user if
 // current version is older than the latest release.
 func checkUpdates(curVer string) {
+	// Get latest release
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	// Fetch the latest release
-	client := util.GithubClient(ctx)
+	client := github.NewClient(nil)
 	release, _, err := client.Repositories.GetLatestRelease(ctx, "renproject", "darknode-cli")
 	if err != nil {
 		return

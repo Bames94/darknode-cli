@@ -1,15 +1,19 @@
 package util
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"os"
+	"net/http"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/google/go-github/v31/github"
+	"github.com/hashicorp/go-version"
 	"github.com/renproject/darknode-cli/darknode"
 	"github.com/renproject/darknode-cli/darknode/addr"
 	"golang.org/x/crypto/ssh"
@@ -34,42 +38,30 @@ func ParseNodesFromNameAndTags(name, tags string) ([]string, error) {
 	} else if name == "" && tags != "" {
 		return GetNodesByTags(tags)
 	} else if name != "" && tags == "" {
-		return []string{name}, ValidateNodeExistence(name)
+		return []string{name}, ValidateNodeName(name)
 	} else {
 		return nil, ErrTooManyArguments
 	}
 }
 
-// ValidateName validates the given darknode name. It should
-// 1) Only contains letter, number, "-" and "_".
-// 2) No more than 32 characters
-// 3) Do not contain any whitespace
-func ValidateName(name string) error {
-	if strings.TrimSpace(name) != name {
-		return fmt.Errorf("name cannot have whitespace")
-	}
-
-	nameRegex, err := regexp.Compile("^[a-zA-Z0-9_-]{1,32}$")
+// ValidateNodeName checks if there exists a node with given name.
+func ValidateNodeName(name string) error {
+	files, err := ioutil.ReadDir(filepath.Join(Directory, "/darknodes"))
 	if err != nil {
 		return err
 	}
-	if !nameRegex.MatchString(name) {
-		return fmt.Errorf("darknode name should be less than 32 characters and not contain any special character")
+	for _, f := range files {
+		if f.Name() == name {
+			return nil
+		}
 	}
-	return nil
-}
-
-// ValidateNodeExistence checks if there exists a node with given name.
-func ValidateNodeExistence(name string) error {
-	path := filepath.Join(Directory, "darknodes", name)
-	_, err := os.Stat(path)
-	return err
+	return fmt.Errorf("darknode [%v] not found", name)
 }
 
 // Config returns the config of the node with given name.
 func Config(name string) (darknode.GeneralConfig, error) {
 	path := filepath.Join(NodePath(name), "config.json")
-	return darknode.NewGeneralConfigFromJSONFile(path)
+	return darknode.NewConfigFromJSONFile(path)
 }
 
 // ID gets the ID of the node with given name.
@@ -90,11 +82,7 @@ func IP(name string) (string, error) {
 
 	cmd := fmt.Sprintf("cd %v && terraform output ip", NodePath(name))
 	ip, err := CommandOutput(cmd)
-	ip = strings.TrimSpace(ip)
-	if strings.HasPrefix(ip, "\"") {
-		ip = strings.Trim(ip, "\"")
-	}
-	return ip, err
+	return strings.TrimSpace(ip), err
 }
 
 // Version gets the version of the software the darknode currently is running.
@@ -174,6 +162,60 @@ func ValidateTags(have, required string) bool {
 		}
 	}
 	return true
+}
+
+// LatestStableRelease checks the darknode release repo and return the version
+// of the latest release.
+func LatestStableRelease() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client := github.NewClient(nil)
+	opts := &github.ListOptions{
+		PerPage: 50,
+	}
+	latest, err := version.NewVersion("0.0.0")
+	if err != nil {
+		return "", err
+	}
+
+	// Fetch all releases and find the latest stable release tag
+	for {
+		releases, response, err := client.Repositories.ListReleases(ctx, "renproject", "darknode-release", opts)
+		if err != nil {
+			return "", err
+		}
+
+		if response.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("cannot get latest darknode release from github, error code = %v", response.StatusCode)
+		}
+
+		verReg := "^v?[0-9]+\\.[0-9]+\\.[0-9]+$"
+		for _, release := range releases {
+			match, err := regexp.MatchString(verReg, *release.TagName)
+			if err != nil {
+				return "", err
+			}
+			if match {
+				ver, err := version.NewVersion(*release.TagName)
+				if err != nil {
+					return "", err
+				}
+				if ver.GreaterThan(latest) {
+					latest = ver
+				}
+			}
+		}
+		if response.NextPage == 0 {
+			break
+		}
+		opts.Page = response.NextPage
+	}
+	if latest.String() == "0.0.0" {
+		return "", errors.New("cannot find any stable release")
+	}
+
+	return latest.String(), nil
 }
 
 func isDeployed(name string) bool {
